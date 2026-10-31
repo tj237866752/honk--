@@ -1,27 +1,33 @@
 
 #!/usr/bin/env bash
 # Honk 一键安装及管理脚本
-# Official: https://github.com/daeuniverse/honk
+# Honk Official: https://github.com/daeuniverse/honk
+# Installer Repository: https://github.com/tj237866752/honk--
 
-set -Eeuo pipefail
+set -uo pipefail
 
 REPO="daeuniverse/honk"
+RAW_URL="https://raw.githubusercontent.com/tj237866752/honk--/refs/heads/main/honk%20Full%20%E4%B8%80%E9%94%AE%E5%AE%89%E8%A3%85%E7%A8%8B%E5%BA%8F"
+
 BIN="/usr/local/bin/honk-core"
 CMD="/usr/local/bin/honk"
+LIB="/usr/local/lib/honk"
+MANAGER="$LIB/manager.sh"
+
 ETC="/etc/honk"
 DATA="/var/lib/honk"
 UNIT="/etc/systemd/system/honk-core.service"
 ACTIVE="$ETC/active-config"
-TMP="$(mktemp -d)"
 
+TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-red(){ echo -e "\033[31m$*\033[0m"; }
-green(){ echo -e "\033[32m$*\033[0m"; }
-yellow(){ echo -e "\033[33m$*\033[0m"; }
+red(){ printf '\033[31m%s\033[0m\n' "$*"; }
+green(){ printf '\033[32m%s\033[0m\n' "$*"; }
+yellow(){ printf '\033[33m%s\033[0m\n' "$*"; }
 line(){ echo "--------------------------------------------------"; }
 
-if [[ $EUID -ne 0 ]]; then
+if [[ "$EUID" -ne 0 ]]; then
     red "请使用 root 运行"
     exit 1
 fi
@@ -30,25 +36,35 @@ mkdir -p "$ETC" "$DATA"
 chmod 700 "$ETC" "$DATA"
 
 # ==================================================
-# 基础依赖
+# 依赖检查
 # ==================================================
 
-if ! command -v curl >/dev/null 2>&1 ||
-   ! command -v python3 >/dev/null 2>&1 ||
-   ! command -v tar >/dev/null 2>&1; then
+ensure_dependencies(){
+    local missing=()
 
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update
-    apt-get install -y curl ca-certificates python3 tar gzip
-fi
+    for p in curl python3 tar gzip sha256sum; do
+        command -v "$p" >/dev/null 2>&1 || missing+=("$p")
+    done
+
+    if (( ${#missing[@]} > 0 )); then
+        if ! command -v apt-get >/dev/null 2>&1; then
+            red "缺少依赖，且当前系统不支持 apt-get"
+            return 1
+        fi
+
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update || return 1
+        apt-get install -y curl ca-certificates python3 tar gzip coreutils || return 1
+    fi
+    return 0
+}
 
 # ==================================================
-# 下载官方 Honk
+# 官方 Honk 下载与安装
 # ==================================================
 
 install_honk(){
-
-    local arch release_url asset checksum
+    local arch releases asset tag sums_url release_url extracted
 
     case "$(uname -m)" in
         x86_64|amd64)
@@ -58,24 +74,28 @@ install_honk(){
             arch="aarch64-unknown-linux-musl"
             ;;
         *)
-            red "暂不支持的架构：$(uname -m)"
+            red "不支持的系统架构：$(uname -m)"
             return 1
             ;;
     esac
 
     echo
-    echo "正在查询官方 GitHub Releases..."
+    echo "正在查询 Honk 官方 Releases..."
 
-    curl -fsSL \
-      -H "Accept: application/vnd.github+json" \
-      "https://api.github.com/repos/$REPO/releases" \
-      -o "$TMP/releases.json"
+    releases="$TMP/releases.json"
 
-    # 选择最新的非草稿版本
-    release_url="$(
-      python3 - "$TMP/releases.json" "$arch" <<'PY'
+    curl -fsSL --retry 3 \
+        -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/repos/$REPO/releases?per_page=100" \
+        -o "$releases" || {
+            red "获取官方版本列表失败"
+            return 1
+        }
+
+    asset="$(python3 - "$releases" "$arch" <<'PY'
 import json,sys
-data=json.load(open(sys.argv[1]))
+
+data=json.load(open(sys.argv[1],encoding="utf-8"))
 arch=sys.argv[2]
 
 for release in data:
@@ -92,74 +112,81 @@ for release in data:
 
     if candidates:
         candidates.sort(
-            key=lambda a: ("stock" in a["name"].lower(), a["name"]),
+            key=lambda a: ("stock" in a["name"].lower(),a["name"]),
             reverse=True
         )
-        print(candidates[0]["browser_download_url"])
+        print(candidates[0]["name"])
         break
 PY
-    )"
+)"
 
-    if [[ -z "$release_url" ]]; then
-        red "没有找到匹配当前架构的官方 full 安装包"
+    if [[ -z "$asset" ]]; then
+        red "没有找到适合当前架构的官方 full 安装包"
         return 1
     fi
 
-    asset="$(basename "$release_url")"
+    read -r release_url tag < <(
+        python3 - "$releases" "$asset" <<'PY'
+import json,sys
+for r in json.load(open(sys.argv[1],encoding="utf-8")):
+    for a in r.get("assets",[]):
+        if a.get("name")==sys.argv[2]:
+            print(a["browser_download_url"],r["tag_name"])
+            raise SystemExit
+PY
+    )
 
+    if [[ -z "${release_url:-}" || -z "${tag:-}" ]]; then
+        red "无法获取安装包下载地址"
+        return 1
+    fi
+
+    echo "版本：$tag"
     echo "安装包：$asset"
 
-    curl -fL --retry 3 "$release_url" -o "$TMP/$asset"
+    curl -fL --retry 3 "$release_url" -o "$TMP/$asset" || {
+        red "安装包下载失败"
+        return 1
+    }
 
-    # 获取该版本的 SHA256SUMS 并验证
-    local tag sums_url
-    tag="$(
-      python3 - "$TMP/releases.json" "$asset" <<'PY'
+    sums_url="$(python3 - "$releases" "$tag" <<'PY'
 import json,sys
-for r in json.load(open(sys.argv[1])):
-    if any(a.get("name")==sys.argv[2] for a in r.get("assets",[])):
-        print(r["tag_name"])
-        break
-PY
-    )"
-
-    sums_url="$(
-      python3 - "$TMP/releases.json" "$tag" <<'PY'
-import json,sys
-for r in json.load(open(sys.argv[1])):
+for r in json.load(open(sys.argv[1],encoding="utf-8")):
     if r.get("tag_name")==sys.argv[2]:
         for a in r.get("assets",[]):
             if a.get("name")=="SHA256SUMS":
                 print(a["browser_download_url"])
-                break
-        break
+                raise SystemExit
 PY
-    )"
+)"
 
-    if [[ -n "$sums_url" ]]; then
-        curl -fL --retry 3 "$sums_url" -o "$TMP/SHA256SUMS"
-
-        if ! grep -F " $asset" "$TMP/SHA256SUMS" >/dev/null; then
-            red "校验文件中没有找到安装包对应的 SHA256"
-            return 1
-        fi
-
-        (
-            cd "$TMP"
-            sha256sum -c --ignore-missing SHA256SUMS
-        ) || {
-            red "安装包 SHA256 校验失败"
-            return 1
-        }
-    else
-        red "该版本没有提供 SHA256SUMS，停止安装以避免未经校验的二进制文件"
+    if [[ -z "$sums_url" ]]; then
+        red "官方版本没有提供 SHA256SUMS，停止安装"
         return 1
     fi
 
-    mkdir -p "$TMP/unpack"
-    tar -xzf "$TMP/$asset" -C "$TMP/unpack"
+    curl -fL --retry 3 "$sums_url" -o "$TMP/SHA256SUMS" || return 1
 
-    local extracted
+    if ! grep -F " $asset" "$TMP/SHA256SUMS" >/dev/null; then
+        red "SHA256SUMS 中没有找到安装包校验记录"
+        return 1
+    fi
+
+    (
+        cd "$TMP" &&
+        sha256sum -c --ignore-missing SHA256SUMS
+    ) || {
+        red "安装包校验失败"
+        return 1
+    }
+
+    mkdir -p "$TMP/unpack"
+
+    tar -xzf "$TMP/$asset" -C "$TMP/unpack" || {
+        red "安装包解压失败"
+        return 1
+    }
+
     extracted="$(find "$TMP/unpack" -type f -name honk-core -print -quit)"
 
     if [[ -z "$extracted" ]]; then
@@ -167,9 +194,9 @@ PY
         return 1
     fi
 
-    install -m 0755 "$extracted" "$BIN"
+    install -m 0755 "$extracted" "$BIN" || return 1
 
-    green "Honk 安装完成"
+    green "Honk 核心安装完成"
     "$BIN" --version || true
 }
 
@@ -178,44 +205,68 @@ PY
 # ==================================================
 
 scan_configs(){
-
     find "$ETC" -maxdepth 1 -type f \
-      -name "*.dae" \
-      ! -name "*.example.dae" \
-      -printf '%f\n' 2>/dev/null |
-      sort
+        -name "*.dae" \
+        ! -name "*.example.dae" \
+        ! -name "*.bak" \
+        -printf '%f\n' 2>/dev/null | sort
 }
 
-choose_config(){
+get_active_config(){
+    if [[ -s "$ACTIVE" ]]; then
+        local cfg
+        cfg="$(cat "$ACTIVE")"
+        if [[ -f "$cfg" ]]; then
+            printf '%s\n' "$cfg"
+            return 0
+        fi
+    fi
 
+    systemctl show honk-core -p ExecStart --value 2>/dev/null |
+        sed -n 's/.*--config[ =]*\([^ ;}"]*\).*/\1/p' |
+        head -n 1
+}
+
+# ==================================================
+# 选择配置文件
+# ==================================================
+
+choose_config(){
     local -a files=()
-    local f choice i=0
+    local choice i=0 f
 
     mapfile -t files < <(scan_configs)
 
     echo
     line
-    echo "检测到的配置文件"
+    echo "扫描到的 Honk 配置文件"
     line
 
     if (( ${#files[@]} == 0 )); then
-        yellow "没有发现配置文件"
+        yellow "没有发现 .dae 配置文件"
         return 1
     fi
 
     for f in "${files[@]}"; do
-        ((i+=1))
+        i=$((i+1))
         printf "%2d. %-30s %s\n" \
-          "$i" "$f" "$(du -h "$ETC/$f" | awk '{print $1}')"
+            "$i" "$f" "$(du -h "$ETC/$f" | awk '{print $1}')"
     done
 
-    echo "0. 暂不选择"
+    echo "0. 返回"
 
     read -r -p "请选择配置文件编号：" choice
 
-    [[ "$choice" =~ ^[0-9]+$ ]] || return 1
-    (( choice == 0 )) && return 2
-    (( choice >= 1 && choice <= ${#files[@]} )) || return 1
+    [[ "$choice" =~ ^[0-9]+$ ]] || {
+        yellow "输入无效"
+        return 1
+    }
+
+    (( choice == 0 )) && return 1
+    (( choice >= 1 && choice <= ${#files[@]} )) || {
+        yellow "编号无效"
+        return 1
+    }
 
     f="$ETC/${files[$((choice-1))]}"
 
@@ -232,20 +283,54 @@ choose_config(){
     printf '%s\n' "$f" > "$ACTIVE"
     chmod 600 "$ACTIVE" "$f"
 
-    green "已选择：$f"
+    green "已选择配置：$f"
+    return 0
 }
 
 # ==================================================
-# 创建基础配置
+# 导入配置文件
+# ==================================================
+
+import_config(){
+    local source_file name destination
+
+    echo
+    read -r -p "请输入服务器上已有配置文件的完整路径：" source_file
+
+    source_file="${source_file/#\~/$HOME}"
+
+    [[ -f "$source_file" && -s "$source_file" && -r "$source_file" ]] || {
+        red "文件不存在、为空或不可读取"
+        return 1
+    }
+
+    [[ "$source_file" == *.dae ]] || {
+        red "只允许导入 .dae 配置文件"
+        return 1
+    }
+
+    name="$(basename "$source_file")"
+    destination="$ETC/$name"
+
+    if [[ -e "$destination" ]]; then
+        destination="$ETC/imported-$(date +%Y%m%d-%H%M%S).dae"
+    fi
+
+    cp -a "$source_file" "$destination" || return 1
+    chmod 600 "$destination"
+
+    green "配置导入成功：$destination"
+}
+
+# ==================================================
+# 创建官方最小配置
 # ==================================================
 
 create_basic_config(){
-
-    local cfg="$ETC/config.min.dae"
+    local cfg="$ETC/config.dae"
 
     if [[ -e "$cfg" ]]; then
-        yellow "config.min.dae 已存在，不覆盖"
-        return 0
+        cfg="$ETC/config-$(date +%Y%m%d-%H%M%S).dae"
     fi
 
     cat > "$cfg" <<'EOF'
@@ -263,17 +348,19 @@ routing {
 EOF
 
     chmod 600 "$cfg"
+    printf '%s\n' "$cfg" > "$ACTIVE"
 
-    green "基础配置已创建：$cfg"
+    green "最小配置已创建：$cfg"
+    yellow "这是直连测试配置，尚未添加代理节点或订阅"
 }
 
 # ==================================================
-# 更新 systemd
+# 更新 systemd 配置
 # ==================================================
 
 set_service_config(){
-
     local cfg="$1"
+    local temp_unit="$TMP/honk-core.service"
 
     [[ -f "$cfg" && -s "$cfg" && -r "$cfg" ]] || {
         red "配置文件不存在、为空或不可读取"
@@ -293,9 +380,9 @@ set_service_config(){
         return 1
     }
 
-    cat > "$UNIT" <<EOF
+    cat > "$temp_unit" <<EOF
 [Unit]
-Description=honk eBPF Transparent Proxy Engine
+Description=Honk eBPF Transparent Proxy Engine
 Wants=network-online.target
 After=network-online.target
 
@@ -303,7 +390,7 @@ After=network-online.target
 Type=notify
 User=root
 WorkingDirectory=$DATA
-ExecStart=$BIN --config $cfg --disable-timestamp
+ExecStart=$BIN --config "$cfg" --disable-timestamp
 ExecReload=$BIN reload
 Restart=on-failure
 RestartSec=3
@@ -316,33 +403,21 @@ UMask=0077
 WantedBy=multi-user.target
 EOF
 
+    install -m 0644 "$temp_unit" "$UNIT" || return 1
     printf '%s\n' "$cfg" > "$ACTIVE"
-
     chmod 600 "$ACTIVE"
-    systemctl daemon-reload
+
+    systemctl daemon-reload || return 1
 
     green "systemd 配置已更新"
 }
 
-get_active_config(){
-
-    if [[ -s "$ACTIVE" ]]; then
-        cat "$ACTIVE"
-        return
-    fi
-
-    systemctl show honk-core -p ExecStart --value 2>/dev/null |
-      sed -n 's/.*--config \([^ ;}]*\).*/\1/p' |
-      head -n1
-}
-
 # ==================================================
-# 订阅配置编辑
+# 订阅编辑
 # ==================================================
 
 add_subscription(){
-
-    local cfg url tag route
+    local cfg url tag route answer
 
     cfg="$(get_active_config)"
 
@@ -363,6 +438,11 @@ add_subscription(){
         return 1
     }
 
+    [[ "$url" != *"'"* && "$url" != *'\'* ]] || {
+        red "订阅链接包含不支持的字符"
+        return 1
+    }
+
     read -r -p "订阅标签 [managed_sub]：" tag
     tag="${tag:-managed_sub}"
 
@@ -372,37 +452,31 @@ add_subscription(){
     }
 
     read -r -p "下载路由：1.direct  2.proxy：" route
-    [[ "$route" == "2" ]] && route="proxy" || route="direct"
+    case "$route" in
+        2) route="proxy" ;;
+        *) route="direct" ;;
+    esac
 
-    # URL 使用单引号，拒绝包含单引号的 URL，避免破坏配置语法
-    [[ "$url" != *"'"* ]] || {
-        red "订阅链接包含单引号，无法安全写入"
-        return 1
-    }
-
-    if grep -Eq "^[[:space:]]*$tag[[:space:]]*:" "$cfg"; then
-        red "标签 $tag 已存在，请使用其他标签"
-        return 1
-    fi
-
-    cp -a "$cfg" "$cfg.$(date +%Y%m%d-%H%M%S).bak"
+    # 修改前备份
+    cp -a "$cfg" "$cfg.$(date +%Y%m%d-%H%M%S).bak" || return 1
 
     HONK_CFG="$cfg" \
     HONK_URL="$url" \
     HONK_TAG="$tag" \
     HONK_ROUTE="$route" \
     python3 <<'PY'
-import os,re
+import os,re,sys,tempfile
 
-p=os.environ["HONK_CFG"]
+path=os.environ["HONK_CFG"]
 url=os.environ["HONK_URL"]
 tag=os.environ["HONK_TAG"]
 route=os.environ["HONK_ROUTE"]
 
-s=open(p,encoding="utf-8").read()
+with open(path,encoding="utf-8") as f:
+    text=f.read()
 
-# 查找 subscription 顶层区块
-m=re.search(r'(?m)^[ \t]*subscription[ \t]*\{',s)
+# 只匹配顶层 subscription，不匹配 assets.subscription
+m=re.search(r'(?m)^subscription[ \t]*\{',text)
 
 entry=f"""
     {tag}: '{url}' {{
@@ -410,18 +484,16 @@ entry=f"""
     }}
 """
 
-if not m:
-    s=s.rstrip()+"\n\nsubscription {\n"+entry+"}\n"
-else:
-    start=s.find("{",m.start())
+if m:
+    start=text.find("{",m.start())
     depth=0
     quote=None
     escaped=False
     comment=False
     end=None
 
-    for i in range(start,len(s)):
-        c=s[i]
+    for i in range(start,len(text)):
+        c=text[i]
 
         if comment:
             if c=="\n":
@@ -450,29 +522,62 @@ else:
                 break
 
     if end is None:
-        raise SystemExit("subscription 区块括号不匹配，未修改配置")
+        sys.exit("subscription 区块括号不匹配，配置未修改")
 
-    s=s[:end]+entry+s[end:]
+    block=text[start:end+1]
 
-with open(p,"w",encoding="utf-8") as f:
-    f.write(s)
+    if re.search(
+        r'(?m)^\s*'+re.escape(tag)+r'\s*:',
+        block
+    ):
+        sys.exit("订阅标签已经存在，配置未修改")
+
+    text=text[:end]+entry+text[end:]
+
+else:
+    text=text.rstrip()+"\n\nsubscription {\n"+entry+"}\n"
+
+# 原子写入，避免中途写入失败损坏配置
+directory=os.path.dirname(path)
+fd,tmp=tempfile.mkstemp(prefix=".honk-",dir=directory)
+
+try:
+    with os.fdopen(fd,"w",encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp,path)
+except Exception:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
 PY
+
+    if [[ $? -ne 0 ]]; then
+        red "订阅写入失败，原配置备份已保留"
+        return 1
+    fi
 
     chmod 600 "$cfg"
 
-    green "订阅已写入配置文件"
+    green "订阅添加成功"
     echo "配置文件：$cfg"
     echo "订阅标签：$tag"
     echo "路由方式：$route"
-    echo "原文件备份：$cfg.*.bak"
+    echo "原配置备份：$cfg.*.bak"
 
     read -r -p "现在重载服务？[y/N]：" answer
 
     if [[ "$answer" =~ ^[Yy]$ ]]; then
         if systemctl is-active --quiet honk-core; then
-            systemctl reload honk-core
+            systemctl reload honk-core || {
+                yellow "重载失败，请查看服务日志"
+                return 1
+            }
         else
-            yellow "服务尚未运行，请先启动服务"
+            yellow "服务尚未运行"
         fi
     fi
 }
@@ -482,7 +587,6 @@ PY
 # ==================================================
 
 check_config(){
-
     local cfg
 
     cfg="$(get_active_config)"
@@ -498,30 +602,39 @@ check_config(){
     }
 
     if grep -q 'https://example.com/sub' "$cfg"; then
-        red "发现示例订阅地址 https://example.com/sub"
-        red "请先删除或替换这个占位地址"
+        red "发现示例订阅地址，请删除或替换"
         return 1
     fi
 
-    if ! grep -Eq '^[[:space:]]*[A-Za-z_][A-Za-z0-9_-]*[[:space:]]*\{' "$cfg"; then
-        red "没有检测到有效配置区块"
+    if ! grep -Eq '^global[[:space:]]*\{' "$cfg"; then
+        red "没有检测到 global 配置区块"
+        return 1
+    fi
+
+    if ! grep -Eq '^routing[[:space:]]*\{' "$cfg"; then
+        red "没有检测到 routing 配置区块"
         return 1
     fi
 
     green "基础检查通过：$cfg"
-    yellow "注意：基础检查不等于完整语法验证，最终以 Honk 启动结果为准"
+    yellow "注意：基础检查不等于完整 DAE 语法验证"
+    return 0
 }
 
 # ==================================================
-# 启动服务
+# 服务管理
 # ==================================================
 
 start_service(){
-
     check_config || return 1
 
-    systemctl daemon-reload
-    systemctl start honk-core
+    [[ -x "$BIN" ]] || {
+        red "Honk 核心程序不存在"
+        return 1
+    }
+
+    systemctl daemon-reload || return 1
+    systemctl start honk-core || true
 
     sleep 2
 
@@ -534,17 +647,30 @@ start_service(){
     fi
 }
 
-# ==================================================
-# 配置备份
-# ==================================================
+stop_service(){
+    systemctl stop honk-core
+    systemctl status honk-core --no-pager -l || true
+}
+
+restart_service(){
+    check_config || return 1
+    systemctl restart honk-core || true
+    sleep 2
+
+    if systemctl is-active --quiet honk-core; then
+        green "Honk 重启成功"
+    else
+        red "Honk 重启失败"
+        journalctl -u honk-core -n 60 --no-pager -o cat
+        return 1
+    fi
+}
 
 backup_config(){
-
     local cfg
-
     cfg="$(get_active_config)"
 
-    [[ -f "$cfg" ]] || {
+    [[ -n "$cfg" && -f "$cfg" ]] || {
         red "没有有效配置文件"
         return 1
     }
@@ -553,9 +679,46 @@ backup_config(){
     chmod 700 "$ETC/backup"
 
     cp -a "$cfg" \
-      "$ETC/backup/$(basename "$cfg").$(date +%Y%m%d-%H%M%S).bak"
+        "$ETC/backup/$(basename "$cfg").$(date +%Y%m%d-%H%M%S).bak" || return 1
 
-    green "备份完成：$ETC/backup"
+    green "配置备份完成：$ETC/backup"
+}
+
+# ==================================================
+# 管理程序部署
+# ==================================================
+
+install_manager(){
+    local temp_manager="$TMP/manager.sh"
+
+    mkdir -p "$LIB"
+
+    echo "正在部署独立管理程序..."
+
+    curl -fsSL --retry 3 "$RAW_URL" -o "$temp_manager" || {
+        red "管理程序下载失败"
+        return 1
+    }
+
+    bash -n "$temp_manager" || {
+        red "管理程序语法检查失败"
+        return 1
+    }
+
+    install -m 0755 "$temp_manager" "$MANAGER" || return 1
+
+    cat > "$CMD" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$EUID" -ne 0 ]]; then
+    echo "请使用 root 运行"
+    exit 1
+fi
+exec bash /usr/local/lib/honk/manager.sh menu "$@"
+EOF
+
+    chmod 0755 "$CMD"
+
+    green "管理程序部署完成"
 }
 
 # ==================================================
@@ -563,12 +726,12 @@ backup_config(){
 # ==================================================
 
 uninstall(){
+    local choice confirm
 
     echo
     line
-    echo "卸载 Honk"
+    echo "Honk 卸载"
     line
-
     echo "1. 仅卸载程序，保留配置和数据"
     echo "2. 完全卸载，包括配置和数据"
     echo "0. 取消"
@@ -577,25 +740,38 @@ uninstall(){
 
     case "$choice" in
         1)
-            systemctl disable --now honk-core 2>/dev/null || true
-            rm -f "$UNIT" "$BIN" "$CMD" "$ACTIVE"
-            systemctl daemon-reload
-            systemctl reset-failed honk-core 2>/dev/null || true
-            green "程序已卸载，配置和数据已保留"
-            exit 0
-            ;;
-        2)
-            read -r -p "确认删除全部 Honk 配置和数据？输入 YES：" confirm
+            read -r -p "确认卸载程序？输入 YES：" confirm
             [[ "$confirm" == "YES" ]] || return 0
 
             systemctl disable --now honk-core 2>/dev/null || true
+
             rm -f "$UNIT" "$BIN" "$CMD"
-            rm -rf "$ETC" "$DATA"
+            rm -f "$MANAGER"
+
             systemctl daemon-reload
             systemctl reset-failed honk-core 2>/dev/null || true
+
+            green "程序已卸载"
+            green "配置和数据保留在 $ETC 和 $DATA"
+            exit 0
+            ;;
+
+        2)
+            read -r -p "确认删除所有配置和数据？输入 DELETE：" confirm
+            [[ "$confirm" == "DELETE" ]] || return 0
+
+            systemctl disable --now honk-core 2>/dev/null || true
+
+            rm -f "$UNIT" "$BIN" "$CMD"
+            rm -rf "$LIB" "$ETC" "$DATA"
+
+            systemctl daemon-reload
+            systemctl reset-failed honk-core 2>/dev/null || true
+
             green "Honk 已完全卸载"
             exit 0
             ;;
+
         *)
             return 0
             ;;
@@ -607,11 +783,10 @@ uninstall(){
 # ==================================================
 
 manager(){
-
     while true; do
+        local cfg status n
 
-        local cfg status
-        cfg="$(get_active_config || true)"
+        cfg="$(get_active_config)"
         status="$(systemctl is-active honk-core 2>/dev/null || true)"
 
         echo
@@ -635,10 +810,12 @@ manager(){
         echo "10. 查看当前配置"
         echo "11. 备份当前配置"
         echo "12. 检查配置文件"
+        echo "13. 导入配置文件"
+        echo "14. 创建最小配置"
         echo
-        echo "13. 设置开机启动"
-        echo "14. 取消开机启动"
-        echo "15. 查看 Honk 版本"
+        echo "15. 设置开机启动"
+        echo "16. 取消开机启动"
+        echo "17. 查看 Honk 版本"
         echo
         echo " 0. 卸载 Honk"
         line
@@ -646,48 +823,30 @@ manager(){
         read -r -p "请输入数字：" n
 
         case "$n" in
-
-            1)
-                start_service
-                ;;
-
-            2)
-                systemctl stop honk-core
-                systemctl status honk-core --no-pager -l
-                ;;
-
-            3)
-                check_config && systemctl restart honk-core
-                systemctl status honk-core --no-pager -l
-                ;;
-
+            1) start_service || true ;;
+            2) stop_service || true ;;
+            3) restart_service || true ;;
             4)
-                systemctl reload honk-core
-                ;;
-
-            5)
-                systemctl status honk-core --no-pager -l
-                ;;
-
-            6)
-                journalctl -u honk-core -n 100 --no-pager -o cat
-                ;;
-
-            7)
-                journalctl -fu honk-core -o cat
-                ;;
-
-            8)
-                choose_config
-                if [[ $? -eq 0 ]]; then
-                    set_service_config "$(get_active_config)"
+                if systemctl is-active --quiet honk-core; then
+                    systemctl reload honk-core || true
+                else
+                    yellow "服务尚未运行"
                 fi
                 ;;
-
-            9)
-                add_subscription
+            5) systemctl status honk-core --no-pager -l || true ;;
+            6) journalctl -u honk-core -n 100 --no-pager -o cat ;;
+            7) journalctl -fu honk-core -o cat ;;
+            8)
+                if choose_config; then
+                    cfg="$(get_active_config)"
+                    set_service_config "$cfg" || true
+                    if systemctl is-active --quiet honk-core; then
+                        read -r -p "配置已切换，是否重启服务？[y/N]：" answer
+                        [[ "$answer" =~ ^[Yy]$ ]] && restart_service || true
+                    fi
+                fi
                 ;;
-
+            9) add_subscription || true ;;
             10)
                 cfg="$(get_active_config)"
                 if [[ -f "$cfg" ]]; then
@@ -696,41 +855,101 @@ manager(){
                     red "配置文件不存在"
                 fi
                 ;;
-
-            11)
-                backup_config
-                ;;
-
-            12)
-                check_config
-                ;;
-
+            11) backup_config || true ;;
+            12) check_config || true ;;
             13)
-                systemctl enable honk-core
-                green "已设置开机启动"
+                if import_config; then
+                    if choose_config; then
+                        set_service_config "$(get_active_config)" || true
+                    fi
+                fi
                 ;;
-
             14)
-                systemctl disable honk-core
-                green "已取消开机启动"
+                create_basic_config
+                set_service_config "$(get_active_config)" || true
                 ;;
-
             15)
-                "$BIN" --version
+                systemctl enable honk-core && green "已设置开机启动"
                 ;;
-
-            0)
-                uninstall
+            16)
+                systemctl disable honk-core && green "已取消开机启动"
                 ;;
-
-            *)
-                red "无效选项"
+            17)
+                if [[ -x "$BIN" ]]; then
+                    "$BIN" --version
+                else
+                    red "Honk 核心程序不存在"
+                fi
                 ;;
+            0) uninstall ;;
+            *) yellow "无效选项" ;;
         esac
 
         echo
-        read -r -p "按回车键继续..." _
+        read -r -p "按回车键返回菜单..." _
     done
+}
+
+# ==================================================
+# 安装后的配置流程
+# ==================================================
+
+configure_after_install(){
+    local cfg choice answer
+
+    echo
+    line
+    echo "配置文件设置"
+    line
+
+    if [[ -n "$(scan_configs)" ]]; then
+        if ! choose_config; then
+            yellow "暂未选择配置文件"
+            return 0
+        fi
+    else
+        echo "1. 创建官方最小配置"
+        echo "2. 导入现有配置文件"
+        echo "0. 暂时跳过"
+
+        read -r -p "请选择：" choice
+
+        case "$choice" in
+            1)
+                create_basic_config
+                ;;
+            2)
+                import_config || return 0
+                choose_config || return 0
+                ;;
+            *)
+                yellow "暂时跳过配置"
+                return 0
+                ;;
+        esac
+    fi
+
+    cfg="$(get_active_config)"
+    [[ -n "$cfg" && -f "$cfg" ]] || return 0
+
+    set_service_config "$cfg" || return 1
+
+    echo
+    read -r -p "现在配置订阅链接？[Y/n]：" answer
+
+    if [[ ! "$answer" =~ ^[Nn]$ ]]; then
+        add_subscription || true
+    fi
+
+    echo
+    read -r -p "现在启动 Honk 服务？[y/N]：" answer
+
+    if [[ "$answer" =~ ^[Yy]$ ]]; then
+        if check_config; then
+            systemctl enable honk-core || true
+            start_service || true
+        fi
+    fi
 }
 
 # ==================================================
@@ -744,112 +963,44 @@ fi
 
 echo
 line
-echo "             HONK 安装程序"
+echo "              HONK 安装程序"
 line
+
+ensure_dependencies || exit 1
 
 if [[ -x "$BIN" ]]; then
-    echo "检测到已有 Honk："
+    echo "检测到已安装 Honk："
     "$BIN" --version || true
     echo
-    echo "1. 保留现有版本"
+    echo "1. 保留当前版本"
     echo "2. 更新到官方最新版本"
+
     read -r -p "请选择 [1/2]：" update_choice
 
-    if [[ "$update_choice" == "2" ]]; then
-        install_honk
-    fi
+    case "$update_choice" in
+        2)
+            install_honk || exit 1
+            ;;
+        *)
+            green "保留当前 Honk 版本"
+            ;;
+    esac
 else
-    install_honk
+    install_honk || exit 1
 fi
 
-# 没有配置文件时创建基础配置
-if [[ -z "$(scan_configs)" ]]; then
-    create_basic_config
-fi
+# 先部署管理程序，确保后续配置流程中断也能使用管理命令
+install_manager || exit 1
 
-# 安装管理命令
-cat > "$CMD" <<'MANAGER'
-#!/usr/bin/env bash
-exec bash -c '
-if [[ $EUID -ne 0 ]]; then
-    echo "请使用 root 运行"
-    exit 1
-fi
-source /usr/local/lib/honk-manager.sh
-'
-MANAGER
-
-mkdir -p /usr/local/lib
-
-# 管理程序单独保存，快捷命令直接调用
-cat > /usr/local/lib/honk-manager.sh <<'MANAGER_SCRIPT'
-# 由安装脚本生成
-MANAGER_SCRIPT
-
-# 将本脚本中的管理函数部分保存为独立管理程序：
-# 重新执行当前脚本 menu 参数即可进入管理模式。
-# 因此快捷命令直接重新调用安装脚本所在位置不可靠，
-# 这里将管理入口固化为独立启动器。
-chmod 0755 "$CMD"
-
-# 生成独立管理脚本：从当前安装脚本复制自身到固定位置
-install -m 0755 "$0" /usr/local/lib/honk-installer.sh
-
-cat > "$CMD" <<'EOF'
-#!/usr/bin/env bash
-exec bash /usr/local/lib/honk-installer.sh menu
-EOF
-chmod 0755 "$CMD"
-
-# 选择配置文件
-echo
-line
-echo "扫描配置文件"
-line
-
-if choose_config; then
-    set_service_config "$(get_active_config)"
-else
-    yellow "尚未选择配置，之后可运行 honk 再选择"
-fi
-
-selected="$(get_active_config || true)"
-
-# 安装结束订阅设置
-if [[ -n "$selected" && -f "$selected" ]]; then
-
-    echo
-    line
-    echo "安装后订阅配置"
-    line
-
-    read -r -p "现在配置订阅链接？[Y/n]：" answer
-
-    if [[ ! "$answer" =~ ^[Nn]$ ]]; then
-        add_subscription
-    fi
-fi
-
-# 启动确认
-if [[ -n "$selected" && -f "$selected" ]]; then
-
-    echo
-    read -r -p "现在启动 Honk 服务？[y/N]：" answer
-
-    if [[ "$answer" =~ ^[Yy]$ ]]; then
-        if check_config; then
-            systemctl enable honk-core
-            start_service
-        else
-            yellow "配置检查未通过，暂不启动"
-        fi
-    fi
-fi
+# 配置、订阅、systemd、启动
+configure_after_install
 
 echo
 line
-green "Honk 安装 / 更新完成"
+green "Honk 安装 / 更新流程完成"
 echo "管理命令：honk"
+echo "核心程序：$BIN"
+echo "管理程序：$MANAGER"
 echo "配置目录：$ETC"
 echo "数据目录：$DATA"
 line
